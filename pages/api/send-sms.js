@@ -1,114 +1,77 @@
-// /pages/api/send-sms.js
-import fs from 'fs'
-import axios from 'axios'
-import crypto from 'crypto'
+import { IncomingForm } from 'formidable';
+import { SolapiMessageService } from 'solapi';
 
 export const config = {
   api: {
-    bodyParser: false
-  }
-}
+    bodyParser: false,
+  },
+};
 
-const apiKey = process.env.NEXT_PUBLIC_SMS_API_KEY
-const apiSecret = process.env.NEXT_PUBLIC_SMS_API_SECRET
-const senderNumber = process.env.NEXT_PUBLIC_SMS_SENDER
+const messageService = new SolapiMessageService(
+  'NCSKIFZNISNKQ5PM',
+  'DG4K9K4L79GJUIBDJJ2OEDXTTHNIINPZ'
+);
+
+const SMS_SENDER_NUMBER = '01025670099';
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).end()
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
 
-  const formidable = await import('formidable')
-  const form = formidable.default({ multiples: false })
+  const form = new IncomingForm({ uploadDir: './uploads', keepExtensions: true });
 
   form.parse(req, async (err, fields, files) => {
     if (err) {
-      console.error('폼 파싱 실패:', err)
-      return res.status(500).json({ error: '폼 파싱 실패' })
+      console.error('❌ Form parsing error:', err);
+      return res.status(500).json({ success: false, error: 'Form parsing failed' });
     }
-
-    const { message, receivers } = fields
-    let receiverList = []
 
     try {
-      receiverList = JSON.parse(receivers)
-    } catch (e) {
-      return res.status(400).json({ error: '수신자 형식 오류' })
-    }
+      const message = fields.message?.[0];
+      const receivers = JSON.parse(fields.receivers?.[0] || '[]');
+      const image = files.image?.[0];
 
-    if (!message || !Array.isArray(receiverList)) {
-      return res.status(400).json({ error: '메시지와 수신자 목록이 필요합니다' })
-    }
-
-    const date = new Date().toISOString()
-    const salt = crypto.randomBytes(32).toString('hex')
-    const hmacData = date + salt
-    const signature = crypto
-      .createHmac('sha256', apiSecret)
-      .update(hmacData)
-      .digest('hex')
-
-    let imageId = null
-
-    // 이미지가 있다면 Solapi에 업로드
-if (files.image) {
-  try {
-    const FormData = (await import('form-data')).default
-    const formData = new FormData()
-
-    // 배열 여부 확인
-    const imageFile = Array.isArray(files.image) ? files.image[0] : files.image
-
-    if (!imageFile) {
-      return res.status(400).json({ error: '이미지 파일이 없습니다.' })
-    }
-
-    const filePath = imageFile.filepath || imageFile.filePath || imageFile.path
-    if (!filePath) {
-      return res.status(400).json({ error: '이미지 파일 경로를 찾을 수 없습니다.' })
-    }
-
-    formData.append('file', fs.createReadStream(filePath))
-
-    // Solapi 이미지 업로드 요청...
-  } catch (e) {
-    console.error('이미지 업로드 실패:', e.response?.data || e.message)
-    return res.status(500).json({ error: '이미지 업로드 실패' })
-  }
-}
-
-    const results = []
-
-    for (const to of receiverList) {
-      try {
-        const response = await axios.post(
-          'https://api.solapi.com/messages/v4/send',
-          {
-            message: {
-              to,
-              from: senderNumber,
-              text: String(message), // ✅ 문자열로 명시적 변환
-              ...(imageId && { imageId })
-            }
-          },
-          {
-            headers: {
-              Authorization: `HMAC-SHA256 apiKey=${apiKey}, date=${date}, salt=${salt}, signature=${signature}`,
-              'Content-Type': 'application/json'
-            }
-          }
-        )
-
-        results.push({ to, status: 'success', data: response.data })
-      } catch (err) {
-        console.error(`Failed to send to ${to}`, err.response?.data || err.message)
-        results.push({
-          to,
-          status: 'fail',
-          error: err.response?.data || err.message
-        })
+      if (!message || receivers.length === 0) {
+        return res.status(400).json({ success: false, error: '문자 내용 또는 대상 없음' });
       }
-    }
 
-    // ✅ 반드시 응답 보내기
-    return res.status(200).json({ results })
-  })
+      // 1️⃣ 이미지 업로드
+      let imageId = null;
+      if (image) {
+        const uploadRes = await messageService.uploadFile(image.filepath, 'MMS');
+        imageId = uploadRes.fileId;
+      }
+
+      // 2️⃣ Promise.all로 병렬 발송
+      const results = await Promise.all(
+        receivers.map(async (to) => {
+          const msgData = {
+            to,
+            from: SMS_SENDER_NUMBER,
+            text: message,
+            ...(imageId ? { imageId } : {})
+          };
+
+          try {
+            const sendRes = await messageService.sendOne(msgData);
+            console.log(`✅ ${to} 발송 성공`, sendRes);
+            return { to, success: true, data: sendRes };
+          } catch (err) {
+            console.error(`❌ ${to} 발송 실패`, err);
+            return { to, success: false, error: err.message || err };
+          }
+        })
+      );
+
+      res.status(200).json({ success: true, results });
+    } catch (error) {
+      console.error('❌ 전송 중 에러:', error.response?.data || error.message);
+      res.status(500).json({
+        success: false,
+        error: error.message,
+        details: error.response?.data,
+      });
+    }
+  });
 }
